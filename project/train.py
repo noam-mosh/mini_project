@@ -2,6 +2,7 @@ import argparse
 import logging
 import yaml
 from transformers import AutoModelForObjectDetection, AutoImageProcessor
+from torchmetrics.detection import MeanAveragePrecision, IntersectionOverUnion
 from torch.utils.data import DataLoader
 import torch
 from pytorch_lightning import Trainer
@@ -98,6 +99,10 @@ class Detr(pl.LightningModule):
         self.lr = lr
         self.lr_backbone = lr_backbone
         self.weight_decay = weight_decay
+        self.map = MeanAveragePrecision(box_format="xywh", class_metrics=True)
+        self.iou = IntersectionOverUnion(box_format="xywh", class_metrics=True, respect_labels=False)
+        self.id2label = id2label
+        
 
     def forward(self, pixel_values, pixel_mask):
         outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask)
@@ -113,11 +118,13 @@ class Detr(pl.LightningModule):
 
         loss = outputs.loss
         loss_dict = outputs.loss_dict
+        pred_boxes = outputs.pred_boxes
+        logits = outputs.logits 
 
-        return loss, loss_dict
+        return loss, loss_dict, pred_boxes, logits
 
     def training_step(self, batch, batch_idx):
-        loss, loss_dict = self.common_step(batch, batch_idx)
+        loss, loss_dict, pred_boxes, logits = self.common_step(batch, batch_idx)
         # logs metrics for each training_step,
         # and the average across the epoch
         self.log("training_loss", loss)
@@ -127,13 +134,137 @@ class Detr(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss, loss_dict = self.common_step(batch, batch_idx)
+        loss, loss_dict, pred_boxes, logits = self.common_step(batch, batch_idx)
         self.log("validation_loss", loss)
         for k, v in loss_dict.items():
             self.log("validation_" + k, v.item())
 
+        batch_size = logits.shape[0]
+        prob = logits.sigmoid()    
+        prob = prob.view(logits.shape[0], -1)
+        k_value = min(300, prob.size(1))
+        topk_values, topk_indexes = torch.topk(prob, k_value, dim=1)
+        scores = topk_values
+        topk_boxes = torch.div(topk_indexes, logits.shape[2], rounding_mode="floor")
+        labels = topk_indexes % logits.shape[2]
+        boxes = torch.gather(pred_boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
+        
+        # topk_values, topk_indexes = torch.topk(prob.view(logits.shape[0], -1), 300, dim=1, sorted=False)
+        # scores = topk_values
+        # labels = topk_indexes % logits.shape[2]
+        preds = []
+        targets = []
+        for i in range(batch_size):
+            preds.append(
+                dict(
+                    boxes=boxes[i],
+                    scores= scores[i],
+                    labels=labels[i],
+                )
+            )
+            targets.append(
+                dict(
+                    boxes=batch["labels"][i]["boxes"],
+                    labels=batch["labels"][i]["class_labels"],
+                )
+            )
+        self.map.update(preds, targets) 
+        self.iou.update(preds, targets)
+        
         return loss
 
+    def on_validation_epoch_end(self):
+        mAPs = {"valid_" + k: v for k, v in self.map.compute().items()}
+        mAPs_per_class = mAPs.pop("valid_map_per_class")
+        mARs_per_class = mAPs.pop("valid_mar_100_per_class")
+        vals_per_class = mAPs.pop("valid_classes") 
+        self.log_dict(mAPs)
+        self.log_dict(
+            {
+                f"valid_map_{label}": value
+                for label, value in zip(self.id2label.values(), mAPs_per_class)
+            },
+        )
+        self.log_dict(
+            {
+                f"valid_mar_100_{label}": value
+                for label, value in zip(self.id2label.values(), mARs_per_class)
+            },
+        )
+        self.log_dict(
+            {
+                f"valid_{label}": value
+                for label, value in zip(self.id2label.values(), vals_per_class)
+            },
+        ) 
+        self.map.reset()
+        IOUs = {"valid_" + k: v for k, v in self.iou.compute().items()} 
+        self.log_dict(IOUs)
+        self.iou.reset()
+
+    
+    def test_step(self, batch, batch_idx):
+        loss, loss_dict, pred_boxes, logits = self.common_step(batch, batch_idx) 
+        self.log("test_loss", loss)
+        for k,v in loss_dict.items():
+          self.log("test_" + k, v.item())
+        
+        batch_size = logits.shape[0]
+        prob = logits.sigmoid()    
+        topk_values, topk_indexes = torch.topk(prob.view(logits.shape[0], -1), 300, dim=1, sorted=False)
+        scores = topk_values
+        labels = topk_indexes % logits.shape[2]
+        preds = [] 
+        targets = []
+        batch_size = logits.shape[0] 
+        for i in range(batch_size):
+            preds.append(
+                dict(
+                    boxes=pred_boxes[i],
+                    scores= scores[i],
+                    labels=labels[i],
+                )
+            )
+            targets.append(
+                dict(
+                    boxes=batch["labels"][i]["boxes"],
+                    labels=batch["labels"][i]["class_labels"],
+                )
+            )
+        self.map.update(preds, targets)
+        self.iou.update(preds, targets) 
+        
+        return loss
+
+    def on_test_epoch_end(self):
+        mAPs = {"test_" + k: v for k, v in self.map.compute().items()}
+        mAPs_per_class = mAPs.pop("test_map_per_class")
+        mARs_per_class = mAPs.pop("test_mar_100_per_class")
+        vals_per_class = mAPs.pop("test_classes") 
+        self.log_dict(mAPs)
+        self.log_dict(
+            {
+                f"test_map_{label}": value
+                for label, value in zip(self.id2label.values(), mAPs_per_class)
+            },
+        )
+        self.log_dict(
+            {
+                f"test_mar_100_{label}": value
+                for label, value in zip(self.id2label.values(), mARs_per_class)
+            },
+        )
+        self.log_dict(
+            {
+                f"test_{label}": value
+                for label, value in zip(self.id2label.values(), vals_per_class)
+            },
+        ) 
+        self.map.reset()
+        IOUs = {"test_" + k: v for k, v in self.iou.compute().items()} 
+        self.log_dict(IOUs)         
+        self.iou.reset() 
+         
     def configure_optimizers(self):
         param_dicts = [
             {"params": [p for n, p in self.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -151,7 +282,6 @@ class Detr(pl.LightningModule):
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print('Using device:', device)
-    
     args, args_text = _parse_args()
 
     dataset_path = '/datasets/TACO-master/data/'
@@ -172,6 +302,10 @@ def main():
     id2label[8] = "unknown"
 
     model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4, id2label=id2label)
+    trainer = Trainer(accelerator='gpu', devices=1, max_epochs=5, gradient_clip_val=0.1)
+    trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
-    trainer = Trainer(accelerator='gpu', devices=1, max_epochs=args.epochs, gradient_clip_val=0.1)
-    trainer.fit(model, train_dataloaders=train_dataloader)
+if __name__ == '__main__':
+    main()
+
+
