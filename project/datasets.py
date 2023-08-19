@@ -6,13 +6,15 @@ def remove_dumped_ids(item):
 
 
 class CocoDetection(torchvision.datasets.CocoDetection):
-    def __init__(self, img_folder, feature_extractor, train=True):
-        ann_file = 'annotations_train.json' if train else 'annotations_test.json'
-        # ann_file = os.path.join(img_folder, "custom_train.json" if train else "custom_val.json")
-        super(CocoDetection, self).__init__(img_folder, ann_file)
+    def __init__(self, root, annFile, feature_extractor, train=True):
+        
+        super(CocoDetection, self).__init__(root=root, annFile=annFile)
 
         self.feature_extractor = feature_extractor
         self.coco.imgs = dict(filter(remove_dumped_ids, self.coco.imgs.items()))
+        img_ids = [i for i in self.coco.getImgIds() if i not in self.coco.catToImgs[self.coco.getCatIds('other')[0]]]
+        self.coco.imgs = {k: self.coco.imgs[k] for k in img_ids}
+
         self.ids = list(self.coco.imgs.keys())
 
     def __getitem__(self, idx):

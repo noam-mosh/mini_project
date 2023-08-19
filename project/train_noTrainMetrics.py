@@ -88,11 +88,10 @@ def _parse_args():
     return args, args_text
 
 class Detr(pl.LightningModule):
-    def __init__(self, lr, lr_backbone, weight_decay, id2label, label2id, dropout):
+    def __init__(self, lr, lr_backbone, weight_decay, id2label, label2id):
         super().__init__()
         # replace COCO classification head with custom head
         self.model = AutoModelForObjectDetection.from_pretrained("microsoft/conditional-detr-resnet-50",
-                                                                 dropout=dropout,
                                                                  id2label=id2label,
                                                                  label2id=label2id,
                                                                  num_labels=7,   
@@ -101,7 +100,7 @@ class Detr(pl.LightningModule):
         self.lr = lr
         self.lr_backbone = lr_backbone
         self.weight_decay = weight_decay
-        self.train_map = MeanAveragePrecision(box_format="xywh", class_metrics=False)
+        # self.train_map = MeanAveragePrecision(box_format="xywh", class_metrics=False)
         self.validation_map = MeanAveragePrecision(box_format="xywh", class_metrics=True)
         # self.test_map = MeanAveragePrecision(box_format="xywh", class_metrics=True)
         # self.iou = IntersectionOverUnion(box_format="xywh", class_metrics=True, respect_labels=False)
@@ -138,45 +137,8 @@ class Detr(pl.LightningModule):
         for k, v in loss_dict.items():
             self.log("train_" + k, v.item())
         
-        prob = logits.sigmoid()    
-        prob = prob.view(logits.shape[0], -1)
-        k_value = min(300, prob.size(1))
-        topk_values, topk_indexes = torch.topk(prob, k_value, dim=1)
-        scores = topk_values
-        topk_boxes = torch.div(topk_indexes, logits.shape[2], rounding_mode="floor")
-        labels = topk_indexes % logits.shape[2]
-        boxes = torch.gather(pred_boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
-        
-        preds = []
-        targets = []
-        for i in range(batch_size):
-            preds.append(
-                dict(
-                    boxes=boxes[i],
-                    scores= scores[i],
-                    labels=labels[i],
-                )
-            )
-            targets.append(
-                dict(
-                    boxes=batch["labels"][i]["boxes"],
-                    labels=batch["labels"][i]["class_labels"],
-                )
-            )
-        self.train_map.update(preds, targets) 
-        
         return loss
 
-
-    def on_train_epoch_end(self):
-        self.train_epoch += 1
-        if self.train_epoch % 10 == 0:
-            mAPs = {"train_" + k: v for k, v in self.train_map.compute().items()}
-            train_map = mAPs.pop("train_map")
-            self.log("train_map", train_map)
-            
-            self.train_map.reset()
-        
 
     def validation_step(self, batch, batch_idx):
         loss, loss_dict, pred_boxes, logits = self.common_step(batch, batch_idx)
@@ -277,7 +239,7 @@ def main():
     id2label = {k: v['name'] for k, v in cats.items()}
     label2id = {v['name']: k for k,v in cats.items()}
 
-    model = Detr(lr=1e-5, lr_backbone=1e-5, weight_decay=5e-5, id2label=id2label, label2id=label2id, dropout=0.2)
+    model = Detr(lr=1e-5, lr_backbone=1e-5, weight_decay=1e-4, id2label=id2label, label2id=label2id)
     trainer = Trainer(accelerator='gpu', devices=1, max_epochs=300, gradient_clip_val=0.1)
     trainer.fit(model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 

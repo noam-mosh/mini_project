@@ -10,6 +10,7 @@ import unittest
 import os
 import datasets
 import pytorch_lightning as pl
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # _logger = logging.getLogger('train')
 
@@ -251,6 +252,13 @@ class Detr(pl.LightningModule):
         ]
         optimizer = torch.optim.AdamW(param_dicts, lr=self.lr,
                                       weight_decay=self.weight_decay)
+        return {
+        "optimizer": optimizer,
+        "lr_scheduler": {
+            "scheduler": ReduceLROnPlateau(optimizer, patience=5),
+            "monitor": 'validation_loss',
+            "frequency": 1
+        }}
 
         return optimizer
 
